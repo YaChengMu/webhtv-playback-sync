@@ -465,6 +465,10 @@ async function ensureDB() {
         } catch (e) { /* 忽略 */ }
         const existingColumns = new Set((tableInfo.rows || []).map(r => r.name));
 
+        // 检测当前主键是否为 dedupeKey（pk > 0 表示该列是主键的一部分）
+        const pkColumn = (tableInfo.rows || []).find(r => r.pk > 0);
+        const needsRebuild = pkColumn && pkColumn.name !== 'dedupeKey';
+
         const hasOldKeyColumn = existingColumns.has('key');
 
         // 目标列定义：列名 -> DDL 片段
@@ -498,43 +502,94 @@ async function ensureDB() {
             webhookTimestamp: "INTEGER DEFAULT 0"
         };
 
-        const addedColumns = [];
-        for (const [colName, colDef] of Object.entries(targetColumns)) {
-            if (!existingColumns.has(colName)) {
-                const sql = `ALTER TABLE playback_history ADD COLUMN ${colName} ${colDef}`;
-                try {
-                    await client.execute(sql);
-                    addedColumns.push(colName);
-                } catch (e) {
-                    console.log(`[迁移] 添加列 ${colName} 失败（可能已存在）: ${e.message}`);
+        // 如果需要重建表（主键不是 dedupeKey），走重建流程
+        if (needsRebuild) {
+            console.log(`[迁移] 当前主键为 "${pkColumn.name}"，需要重建表以将主键改为 dedupeKey`);
+
+            // 1. 补齐所有缺失列（在重建前，确保数据能迁移到新表）
+            for (const [colName, colDef] of Object.entries(targetColumns)) {
+                if (!existingColumns.has(colName)) {
+                    try {
+                        await client.execute(`ALTER TABLE playback_history ADD COLUMN ${colName} ${colDef}`);
+                        existingColumns.add(colName);
+                    } catch (e) { /* 忽略 */ }
                 }
             }
-        }
-        if (addedColumns.length > 0) {
-            console.log(`[迁移] 已添加 ${addedColumns.length} 个缺失列: ${addedColumns.join(', ')}`);
+
+            // 2. 迁移旧数据：key -> dedupeKey
+            if (hasOldKeyColumn) {
+                try {
+                    await client.execute(`
+                        UPDATE playback_history SET 
+                            dedupeKey = CASE WHEN dedupeKey = '' OR dedupeKey IS NULL THEN COALESCE([key], '') ELSE dedupeKey END,
+                            episodeName = CASE WHEN episodeName = '' OR episodeName IS NULL THEN COALESCE(vodRemarks, '') ELSE episodeName END,
+                            flag = CASE WHEN flag = '' OR flag IS NULL THEN COALESCE(vodFlag, '') ELSE flag END
+                        WHERE dedupeKey = '' OR dedupeKey IS NULL
+                    `);
+                } catch (e) { /* 忽略 */ }
+            }
+
+            // 3. 只保留目标列（过滤掉旧列如 key, vodRemarks, vodFlag 等）
+            const keepColumns = Object.keys(targetColumns).filter(c => existingColumns.has(c));
+            const colList = keepColumns.join(', ');
+
+            // 4. 重建表：创建新表 -> 复制数据 -> 删除旧表 -> 重命名
+            await client.execute(`CREATE TABLE playback_history_new (
+                dedupeKey TEXT PRIMARY KEY,
+                eventId TEXT DEFAULT '',
+                configKey TEXT DEFAULT '',
+                configName TEXT DEFAULT '',
+                siteKey TEXT DEFAULT '',
+                siteName TEXT DEFAULT '',
+                vodId TEXT DEFAULT '',
+                vodPic TEXT,
+                vodName TEXT,
+                flag TEXT,
+                episodeName TEXT,
+                episodeUrl TEXT,
+                sessionId TEXT DEFAULT '',
+                state TEXT DEFAULT '',
+                progress REAL DEFAULT 0.0,
+                revSort INTEGER DEFAULT 0,
+                revPlay INTEGER DEFAULT 0,
+                createTime INTEGER DEFAULT 0,
+                opening INTEGER DEFAULT 0,
+                ending INTEGER DEFAULT 0,
+                position INTEGER DEFAULT 0,
+                duration INTEGER DEFAULT 0,
+                speed REAL DEFAULT 1.0,
+                scale INTEGER DEFAULT 0,
+                cid INTEGER DEFAULT 0,
+                completed INTEGER DEFAULT 0,
+                webhookTimestamp INTEGER DEFAULT 0
+            )`);
+            await client.execute(`INSERT INTO playback_history_new (${colList}) SELECT ${colList} FROM playback_history`);
+            await client.execute(`DROP TABLE playback_history`);
+            await client.execute(`ALTER TABLE playback_history_new RENAME TO playback_history`);
+            console.log(`[迁移] 表重建完成，主键已改为 dedupeKey，保留 ${keepColumns.length} 列`);
+        } else {
+            // 主键正确，只需补齐缺失列
+            const addedColumns = [];
+            for (const [colName, colDef] of Object.entries(targetColumns)) {
+                if (!existingColumns.has(colName)) {
+                    const sql = `ALTER TABLE playback_history ADD COLUMN ${colName} ${colDef}`;
+                    try {
+                        await client.execute(sql);
+                        addedColumns.push(colName);
+                    } catch (e) {
+                        console.log(`[迁移] 添加列 ${colName} 失败（可能已存在）: ${e.message}`);
+                    }
+                }
+            }
+            if (addedColumns.length > 0) {
+                console.log(`[迁移] 已添加 ${addedColumns.length} 个缺失列: ${addedColumns.join(', ')}`);
+            }
         }
 
         // 为 eventId 创建索引（幂等查询用）
         try {
             await client.execute(`CREATE INDEX IF NOT EXISTS idx_eventId ON playback_history(eventId)`);
         } catch (e) { /* 忽略 */ }
-
-        // 如果有旧数据（key 列有值，dedupeKey 为空），尝试迁移
-        if (hasOldKeyColumn) {
-            try {
-                // 将旧 key 数据迁移到 dedupeKey，并将 vodRemarks 迁移到 episodeName
-                await client.execute(`
-                    UPDATE playback_history SET 
-                        dedupeKey = CASE WHEN dedupeKey = '' OR dedupeKey IS NULL THEN COALESCE([key], '') ELSE dedupeKey END,
-                        episodeName = CASE WHEN episodeName = '' OR episodeName IS NULL THEN COALESCE(vodRemarks, '') ELSE episodeName END,
-                        flag = CASE WHEN flag = '' OR flag IS NULL THEN COALESCE(vodFlag, '') ELSE flag END
-                    WHERE dedupeKey = '' OR dedupeKey IS NULL
-                `);
-                console.log('旧数据迁移完成');
-            } catch (e) {
-                console.log('旧数据迁移（可能无需迁移）:', e.message);
-            }
-        }
 
         dbInitDone = true;
         console.log('数据库初始化成功');
