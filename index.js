@@ -120,7 +120,11 @@ app.use((req, res, next) => {
 // 返回 { "items": [...], "nextSince": ... } 格式
 // =========================================================================
 app.get('/', async (req, res) => {
-    const configKey = req.headers['x-webhtv-config-key'] || '';
+    const configKey = (req.headers['x-webhtv-config-key'] || '').trim();
+    const configName = (req.headers['x-webhtv-config-name'] || '').trim();
+    const token = (req.headers['x-webhtv-token'] || '').trim();
+
+    console.log(`\n[远端同步请求] configKey="${configKey}" configName="${configName}" token="${token ? token.substring(0,8)+'...' : '(无)'}"`);
 
     try {
         await ensureDB();
@@ -153,11 +157,27 @@ app.get('/', async (req, res) => {
         const result = await client.execute(safeSql) || {};
         const rawRows = result.rows || [];
 
-        // 过滤匹配的 configKey
+        console.log(`[远端同步] 数据库总行数: ${rawRows.length}`);
+        // 打印每行的 configKey 用于诊断
+        if (rawRows.length > 0) {
+            console.log(`[远端同步] 各行的 configKey:`);
+            rawRows.forEach((r, i) => {
+                console.log(`  [${i}] key="${r.key}" configKey="${r.configKey}" vodName="${r.vodName}"`);
+            });
+        }
+
+        // 过滤匹配的 configKey（空 configKey 视为通用，返回给所有接口）
         const filteredRows = rawRows.filter(r => {
             if (!r) return false;
-            return r.configKey === '' || r.configKey === configKey;
+            const rowConfigKey = (r.configKey || '').trim();
+            // 如果请求带了 configKey，只返回匹配的或无 configKey 的旧数据
+            if (configKey) {
+                return rowConfigKey === '' || rowConfigKey === configKey;
+            }
+            return true; // 没传 configKey 时返回全部
         });
+
+        console.log(`[远端同步] configKey 过滤后: ${filteredRows.length} 条`);
 
         // 转换为文档 13.4.4 规定的字段名
         const items = filteredRows.map(r => {
@@ -174,7 +194,7 @@ app.get('/', async (req, res) => {
             const finalDuration = Number(r.duration) || 3600000;
             const finalPosition = Number(r.position) || 1000;
 
-            return {
+            const item = {
                 // === 文档规定字段 ===
                 configKey: r.configKey || '',
                 configName: r.configName || '',
@@ -183,15 +203,13 @@ app.get('/', async (req, res) => {
                 vodId: vodId,
                 vodName: r.vodName || '未知视频',
                 vodPic: r.vodPic || '',
-                // 文档用 flag，数据库用 vodFlag
                 flag: r.vodFlag || siteKey || '默认线路',
-                // 文档用 episodeName，数据库用 vodRemarks
                 episodeName: r.vodRemarks || '已观看',
                 episodeUrl: r.episodeUrl || '',
                 positionMs: finalPosition,
                 durationMs: finalDuration,
                 speed: Number(r.speed) || 1.0,
-                completed: (Number(r.position) > 0 && Number(r.duration) > 0 && Number(r.position) >= Number(r.duration) * 0.95),
+                completed: (finalPosition > 0 && finalDuration > 0 && finalPosition >= finalDuration * 0.95),
                 updatedAt: Number(r.createTime) || Date.now(),
 
                 // === 附加字段（兼容旧客户端） ===
@@ -206,16 +224,25 @@ app.get('/', async (req, res) => {
                 scale: Number(r.scale) || 0,
                 cid: Number(r.cid) || 0
             };
+
+            // 打印每条返回的关键字段
+            console.log(`[远端同步] 返回: siteKey="${item.siteKey}" vodId="${item.vodId}" vodName="${item.vodName}" episodeName="${item.episodeName}" configKey="${item.configKey}" positionMs=${item.positionMs} durationMs=${item.durationMs} updatedAt=${item.updatedAt}`);
+
+            return item;
         });
 
         // 按文档 13.4.4 格式：{ "items": [...], "nextSince": ... }
         const lastItem = items.length > 0 ? items[items.length - 1] : null;
         const nextSince = lastItem ? lastItem.updatedAt : 0;
 
-        res.status(200).json({
+        const response = {
             items: items,
             nextSince: nextSince
-        });
+        };
+
+        console.log(`[远端同步] 最终返回 items=${items.length} nextSince=${nextSince}`);
+
+        res.status(200).json(response);
 
     } catch (err) {
         console.error(`查库失败:`, err.message);
@@ -229,9 +256,13 @@ app.get('/', async (req, res) => {
 // 服务端按 token + configKey 分组，用 key = siteKey_vodId 做主键去重
 // =========================================================================
 app.post('/api/webhook/playback', async (req, res) => {
-    const configKey = req.headers['x-webhtv-config-key'] || '';
-    const configName = req.headers['x-webhtv-config-name'] || '';
+    const configKey = (req.headers['x-webhtv-config-key'] || '').trim();
+    const configName = (req.headers['x-webhtv-config-name'] || '').trim();
     const body = req.body || {};
+
+    console.log(`\n[Webhook 接收] configKey="${configKey}" configName="${configName}"`);
+    console.log(`[Webhook 接收] body keys: ${Object.keys(body).join(', ')}`);
+    console.log(`[Webhook 接收] body type: ${Array.isArray(body) ? 'array' : typeof body}`);
 
     // Webhook 可能是单条对象，也可能是数组（兼容旧版或批量场景）
     let items = [];
@@ -243,11 +274,14 @@ app.post('/api/webhook/playback', async (req, res) => {
         // 单条 Webhook 记录
         items = [body];
     } else {
+        console.log(`[Webhook 接收] 无法解析 body，无 siteKey/key 字段`);
         return res.status(400).json({ code: 400, message: "Bad Request: No valid playback data" });
     }
 
     // 过滤有效条目：必须有 siteKey+vodId 或 key
     const validItems = items.filter(item => item && (item.key || (item.siteKey && item.vodId)));
+
+    console.log(`[Webhook 接收] 收到 ${items.length} 条, 有效 ${validItems.length} 条`);
 
     if (validItems.length === 0) {
         return res.status(400).json({ code: 400, message: "Bad Request: No valid data" });
@@ -267,6 +301,8 @@ app.post('/api/webhook/playback', async (req, res) => {
             const finalConfigKey = configKey || item.configKey || '';
             const finalConfigName = configName || item.configName || '';
             const finalSiteName = item.siteName || '';
+
+            console.log(`[Webhook 写入] key="${item.key}" vodName="${item.vodName}" episodeName="${finalRemarks}" position=${finalPosition} duration=${finalDuration} configKey="${finalConfigKey}"`);
 
             return {
                 sql: `INSERT INTO playback_history (
@@ -306,6 +342,7 @@ app.post('/api/webhook/playback', async (req, res) => {
 
         const client = getDB();
         await client.batch(statements, "write");
+        console.log(`[Webhook 写入] 成功写入 ${statements.length} 条`);
         res.status(200).json({ code: 0, message: `Synced ${statements.length} rows` });
     } catch (err) {
         console.error("Webhook 写入失败:", err.message);
