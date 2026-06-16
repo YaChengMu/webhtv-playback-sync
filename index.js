@@ -60,9 +60,13 @@ app.use((req, res, next) => {
         }
 
         console.log(`\n[Headers] >>>`);
-        console.log(`   x-webhtv-token:      "${req.headers['x-webhtv-token'] || '未携带'}"`);
-        console.log(`   x-webhtv-config-key: "${req.headers['x-webhtv-config-key'] || '未携带'}"`);
+        console.log(`   x-webhtv-token:       "${req.headers['x-webhtv-token'] || '未携带'}"`);
+        console.log(`   x-webhtv-config-key:  "${req.headers['x-webhtv-config-key'] || '未携带'}"`);
         console.log(`   x-webhtv-config-name: "${req.headers['x-webhtv-config-name'] || '未携带'}"`);
+        console.log(`   x-webhtv-timestamp:   "${req.headers['x-webhtv-timestamp'] || '未携带'}"`);
+        console.log(`   x-webhtv-webhook-id:  "${req.headers['x-webhtv-webhook-id'] || '未携带'}"`);
+        console.log(`   x-webhtv-dedupe-key:  "${req.headers['x-webhtv-dedupe-key'] || '未携带'}"`);
+        console.log(`   idempotency-key:      "${req.headers['idempotency-key'] || '未携带'}"`);
 
         if (req.method !== 'GET' && req.method !== 'OPTIONS') {
             console.log(`\n[收到原始数据 (Request Body)] >>>`);
@@ -88,7 +92,7 @@ app.use((req, res, next) => {
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Sync-Token, X-WebHTV-Token, X-WebHTV-Config-Key, X-WebHTV-Config-Name');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Sync-Token, X-WebHTV-Token, X-WebHTV-Config-Key, X-WebHTV-Config-Name, X-WebHTV-Webhook-Id, X-WebHTV-Dedupe-Key, X-WebHTV-Timestamp, Idempotency-Key');
 
     if (req.method === 'OPTIONS') return res.sendStatus(204);
 
@@ -130,15 +134,20 @@ app.get('/', async (req, res) => {
         await ensureDB();
         const safeSql = `
             SELECT 
-                coalesce([key], '') as [key],
+                coalesce(dedupeKey, '') as dedupeKey,
                 coalesce(configKey, '') as configKey,
                 coalesce(configName, '') as configName,
+                coalesce(siteKey, '') as siteKey,
                 coalesce(siteName, '') as siteName,
+                coalesce(vodId, '') as vodId,
                 coalesce(vodPic, '') as vodPic,
                 coalesce(vodName, '未知视频') as vodName,
-                coalesce(vodFlag, '') as vodFlag,
-                coalesce(vodRemarks, '') as vodRemarks,
+                coalesce(flag, '') as flag,
+                coalesce(episodeName, '') as episodeName,
                 coalesce(episodeUrl, '') as episodeUrl,
+                coalesce(sessionId, '') as sessionId,
+                coalesce(state, '') as state,
+                coalesce(progress, 0.0) as progress,
                 coalesce(revSort, 0) as revSort,
                 coalesce(revPlay, 0) as revPlay,
                 coalesce(createTime, 0) as createTime,
@@ -148,7 +157,10 @@ app.get('/', async (req, res) => {
                 coalesce(duration, 0) as duration,
                 coalesce(speed, 1.0) as speed,
                 coalesce(scale, 0) as scale,
-                coalesce(cid, 0) as cid
+                coalesce(cid, 0) as cid,
+                coalesce(completed, 0) as completed,
+                coalesce(eventId, '') as eventId,
+                coalesce(webhookTimestamp, 0) as webhookTimestamp
             FROM playback_history 
             ORDER BY createTime DESC
         `;
@@ -158,62 +170,56 @@ app.get('/', async (req, res) => {
         const rawRows = result.rows || [];
 
         console.log(`[远端同步] 数据库总行数: ${rawRows.length}`);
-        // 打印每行的 configKey 用于诊断
         if (rawRows.length > 0) {
             console.log(`[远端同步] 各行的 configKey:`);
             rawRows.forEach((r, i) => {
-                console.log(`  [${i}] key="${r.key}" configKey="${r.configKey}" vodName="${r.vodName}"`);
+                console.log(`  [${i}] dedupeKey="${r.dedupeKey}" configKey="${r.configKey}" vodName="${r.vodName}"`);
             });
         }
 
-        // 过滤匹配的 configKey（空 configKey 视为通用，返回给所有接口）
+        // 按文档：同一 token 下同一 configKey 为同一套记录
+        // configKey 为空时按当前点播接口写入（兼容旧服务端）
         const filteredRows = rawRows.filter(r => {
             if (!r) return false;
             const rowConfigKey = (r.configKey || '').trim();
-            // 如果请求带了 configKey，只返回匹配的或无 configKey 的旧数据
             if (configKey) {
                 return rowConfigKey === '' || rowConfigKey === configKey;
             }
-            return true; // 没传 configKey 时返回全部
+            return true;
         });
 
         console.log(`[远端同步] configKey 过滤后: ${filteredRows.length} 条`);
 
         // 转换为文档 13.4.4 规定的字段名
         const items = filteredRows.map(r => {
-            let siteKey = '';
-            let vodId = '';
-            const itemKey = String(r.key || '');
-
-            if (itemKey.includes('_')) {
-                const parts = itemKey.split('_');
-                siteKey = parts[0];
-                vodId = parts.slice(1).join('_');
-            }
-
             const finalDuration = Number(r.duration) || 3600000;
             const finalPosition = Number(r.position) || 1000;
+            const isCompleted = r.completed === 1 || r.completed === true ||
+                (finalPosition > 0 && finalDuration > 0 && finalPosition >= finalDuration * 0.95);
 
             const item = {
-                // === 文档规定字段 ===
+                // === 文档 13.4.1/13.4.4 规定字段 ===
                 configKey: r.configKey || '',
                 configName: r.configName || '',
-                siteKey: siteKey,
+                siteKey: r.siteKey || '',
                 siteName: r.siteName || '',
-                vodId: vodId,
+                vodId: r.vodId || '',
                 vodName: r.vodName || '未知视频',
                 vodPic: r.vodPic || '',
-                flag: r.vodFlag || siteKey || '默认线路',
-                episodeName: r.vodRemarks || '已观看',
+                flag: r.flag || r.siteKey || '默认线路',
+                episodeName: r.episodeName || '已观看',
                 episodeUrl: r.episodeUrl || '',
                 positionMs: finalPosition,
                 durationMs: finalDuration,
                 speed: Number(r.speed) || 1.0,
-                completed: (finalPosition > 0 && finalDuration > 0 && finalPosition >= finalDuration * 0.95),
+                completed: isCompleted,
                 updatedAt: Number(r.createTime) || Date.now(),
+                sessionId: r.sessionId || '',
+                state: r.state || '',
+                progress: Number(r.progress) || (finalDuration > 0 ? finalPosition / finalDuration : 0),
 
                 // === 附加字段（兼容旧客户端） ===
-                key: itemKey || `${siteKey}_${vodId}`,
+                dedupeKey: r.dedupeKey || '',
                 revSort: r.revSort === 1 || r.revSort === true,
                 revPlay: r.revPlay === 1 || r.revPlay === true,
                 createTime: Number(r.createTime) || Date.now(),
@@ -225,7 +231,6 @@ app.get('/', async (req, res) => {
                 cid: Number(r.cid) || 0
             };
 
-            // 打印每条返回的关键字段
             console.log(`[远端同步] 返回: siteKey="${item.siteKey}" vodId="${item.vodId}" vodName="${item.vodName}" episodeName="${item.episodeName}" configKey="${item.configKey}" positionMs=${item.positionMs} durationMs=${item.durationMs} updatedAt=${item.updatedAt}`);
 
             return item;
@@ -251,100 +256,153 @@ app.get('/', async (req, res) => {
 });
 
 // =========================================================================
-// Webhook 接收端点 (POST / 和 POST /api/webhook/playback)
-// 文档 13.4.5：App POST 单条播放记录，字段如 schema/event/eventId/siteKey/vodId/positionMs 等
-// 服务端按 token + configKey 分组，用 key = siteKey_vodId 做主键去重
-// 部分 App 版本可能 POST 到根路径 /，因此同时注册两个路由
+// Webhook 接收端点 (POST /)
+// 文档 13.4.5：
+//   - schema 校验 "webhtv.playback.v1"
+//   - 区分 playback.progress / playback.ended 事件
+//   - 用 dedupeKey 做主键（同一播放条目合并）
+//   - 用 eventId / Idempotency-Key 做幂等去重
+//   - configKey 优先从 body 取，header 作为 fallback
 // =========================================================================
 async function handleWebhookPlayback(req, res) {
-    const configKey = (req.headers['x-webhtv-config-key'] || '').trim();
-    const configName = (req.headers['x-webhtv-config-name'] || '').trim();
     const body = req.body || {};
 
-    console.log(`\n[Webhook 接收] configKey="${configKey}" configName="${configName}"`);
-    console.log(`[Webhook 接收] body keys: ${Object.keys(body).join(', ')}`);
-    console.log(`[Webhook 接收] body type: ${Array.isArray(body) ? 'array' : typeof body}`);
-
-    // Webhook 可能是单条对象，也可能是数组（兼容旧版或批量场景）
-    let items = [];
-    if (Array.isArray(body)) {
-        items = body;
-    } else if (Array.isArray(body.items)) {
-        items = body.items;
-    } else if (body.siteKey || body.key) {
-        // 单条 Webhook 记录
-        items = [body];
-    } else {
-        console.log(`[Webhook 接收] 无法解析 body，无 siteKey/key 字段`);
-        return res.status(400).json({ code: 400, message: "Bad Request: No valid playback data" });
+    // 1. schema 校验
+    if (body.schema !== 'webhtv.playback.v1') {
+        console.log(`[Webhook] schema 不匹配: "${body.schema}"`);
+        return res.status(400).json({ code: 400, message: "Bad Request: Invalid schema" });
     }
 
-    // 过滤有效条目：必须有 siteKey+vodId 或 key
-    const validItems = items.filter(item => item && (item.key || (item.siteKey && item.vodId)));
+    // 2. 事件类型
+    const event = body.event || '';
+    console.log(`\n[Webhook 接收] event="${event}"`);
 
-    console.log(`[Webhook 接收] 收到 ${items.length} 条, 有效 ${validItems.length} 条`);
+    // 3. configKey：优先从 body 取，header 作为 fallback
+    const configKey = body.configKey || (req.headers['x-webhtv-config-key'] || '').trim();
+    const configName = body.configName || (req.headers['x-webhtv-config-name'] || '').trim();
 
-    if (validItems.length === 0) {
-        return res.status(400).json({ code: 400, message: "Bad Request: No valid data" });
+    // 4. 幂等 key：eventId 或 Idempotency-Key
+    const eventId = body.eventId || (req.headers['x-webhtv-webhook-id'] || req.headers['idempotency-key'] || '').trim();
+    const dedupeKey = body.dedupeKey || (req.headers['x-webhtv-dedupe-key'] || '').trim();
+
+    console.log(`[Webhook] configKey="${configKey}" configName="${configName}" eventId="${eventId}" dedupeKey="${dedupeKey}"`);
+
+    // 必须有 dedupeKey（用于主键去重同一播放条目）
+    if (!dedupeKey) {
+        console.log(`[Webhook] 缺少 dedupeKey`);
+        return res.status(400).json({ code: 400, message: "Bad Request: Missing dedupeKey" });
     }
+
+    // 必须有 eventId（用于幂等去重）
+    if (!eventId) {
+        console.log(`[Webhook] 缺少 eventId`);
+        return res.status(400).json({ code: 400, message: "Bad Request: Missing eventId" });
+    }
+
+    // playback.ended 事件强制标记 completed
+    const isEndedEvent = (event === 'playback.ended');
+    const bodyCompleted = body.completed === true || body.completed === 1;
+    const finalCompleted = isEndedEvent ? true : bodyCompleted;
+
+    // 字段映射：优先使用文档字段名
+    const finalPosition = body.positionMs !== undefined ? Number(body.positionMs) : Number(body.position || 0);
+    const finalDuration = body.durationMs !== undefined ? Number(body.durationMs) : Number(body.duration || 0);
+    const finalProgress = body.progress !== undefined ? Number(body.progress) : (finalDuration > 0 ? finalPosition / finalDuration : 0);
+    const finalFlag = body.flag || body.vodFlag || '';
+    const finalEpisodeName = body.episodeName || body.vodRemarks || '';
+    const finalSiteName = body.siteName || '';
+    const finalSessionId = body.sessionId || '';
+    const finalState = body.state || '';
+
+    // X-WebHTV-Timestamp（必填 header，秒级时间戳转为毫秒存储）
+    const headerTimestamp = (req.headers['x-webhtv-timestamp'] || '').trim();
+    const webhookTimestamp = headerTimestamp ? Number(headerTimestamp) * 1000 : Date.now();
+
+    console.log(`[Webhook 写入] dedupeKey="${dedupeKey}" vodName="${body.vodName}" episodeName="${finalEpisodeName}" position=${finalPosition} duration=${finalDuration} completed=${finalCompleted} configKey="${configKey}"`);
 
     try {
         await ensureDB();
-        const statements = validItems.map(item => {
-            // 生成或使用 key
-            if (!item.key) item.key = `${item.siteKey}_${item.vodId}`;
+        const client = getDB();
 
-            // 字段映射：优先使用文档字段名，fallback 到旧字段名
-            const finalPosition = item.positionMs !== undefined ? item.positionMs : (item.position || 0);
-            const finalDuration = item.durationMs !== undefined ? item.durationMs : (item.duration || 0);
-            const finalFlag = item.flag || item.vodFlag || '';
-            const finalRemarks = item.episodeName || item.vodRemarks || '';
-            const finalConfigKey = configKey || item.configKey || '';
-            const finalConfigName = configName || item.configName || '';
-            const finalSiteName = item.siteName || '';
+        // 幂等检查：同一 eventId 已处理过则跳过
+        const existing = await client.execute({
+            sql: `SELECT dedupeKey FROM playback_history WHERE eventId = ? LIMIT 1`,
+            args: [eventId]
+        });
+        if (existing.rows && existing.rows.length > 0) {
+            console.log(`[Webhook] eventId="${eventId}" 已处理过，跳过（幂等）`);
+            return res.status(200).json({ code: 0, message: "Already processed (idempotent)", skipped: true });
+        }
 
-            console.log(`[Webhook 写入] key="${item.key}" vodName="${item.vodName}" episodeName="${finalRemarks}" position=${finalPosition} duration=${finalDuration} configKey="${finalConfigKey}"`);
-
-            return {
-                sql: `INSERT INTO playback_history (
-                        [key], configKey, configName, siteName, vodPic, vodName, vodFlag, vodRemarks, episodeUrl, 
-                        revSort, revPlay, createTime, opening, ending, position, duration, speed, scale, cid
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT([key]) DO UPDATE SET
-                        configKey=excluded.configKey, configName=excluded.configName, siteName=excluded.siteName,
-                        vodPic=excluded.vodPic, vodName=excluded.vodName, 
-                        vodFlag=excluded.vodFlag, vodRemarks=excluded.vodRemarks, episodeUrl=excluded.episodeUrl, 
-                        revSort=excluded.revSort, revPlay=excluded.revPlay, createTime=excluded.createTime, 
-                        opening=excluded.opening, ending=excluded.ending, position=excluded.position, 
-                        duration=excluded.duration, speed=excluded.speed, scale=excluded.scale, cid=excluded.cid`,
-                args: [
-                    item.key,
-                    finalConfigKey,
-                    finalConfigName,
-                    finalSiteName,
-                    item.vodPic || '',
-                    item.vodName || '未知视频',
-                    finalFlag,
-                    finalRemarks,
-                    item.episodeUrl || '',
-                    item.revSort ? 1 : 0,
-                    item.revPlay ? 1 : 0,
-                    item.createTime || item.timestamp || Date.now(),
-                    item.opening || 0,
-                    item.ending || 0,
-                    Number(finalPosition),
-                    Number(finalDuration),
-                    item.speed || 1.0,
-                    item.scale || 0,
-                    item.cid || 0
-                ]
-            };
+        // 写入：用 dedupeKey 做主键，同一播放条目合并更新
+        await client.execute({
+            sql: `INSERT INTO playback_history (
+                    dedupeKey, eventId, configKey, configName,
+                    siteKey, siteName, vodId, vodPic, vodName,
+                    flag, episodeName, episodeUrl,
+                    sessionId, state, progress,
+                    revSort, revPlay, createTime, opening, ending,
+                    position, duration, speed, scale, cid, completed,
+                    webhookTimestamp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dedupeKey) DO UPDATE SET
+                    eventId=excluded.eventId,
+                    configKey=excluded.configKey, configName=excluded.configName,
+                    siteKey=excluded.siteKey, siteName=excluded.siteName,
+                    vodId=excluded.vodId, vodPic=excluded.vodPic, vodName=excluded.vodName,
+                    flag=excluded.flag, episodeName=excluded.episodeName, episodeUrl=excluded.episodeUrl,
+                    sessionId=excluded.sessionId, state=excluded.state, progress=excluded.progress,
+                    revSort=excluded.revSort, revPlay=excluded.revPlay, createTime=excluded.createTime,
+                    opening=excluded.opening, ending=excluded.ending,
+                    position=excluded.position, duration=excluded.duration,
+                    speed=excluded.speed, scale=excluded.scale, cid=excluded.cid,
+                    completed=excluded.completed,
+                    webhookTimestamp=excluded.webhookTimestamp`,
+            args: [
+                dedupeKey,
+                eventId,
+                configKey,
+                configName,
+                body.siteKey || '',
+                finalSiteName,
+                body.vodId || '',
+                body.vodPic || '',
+                body.vodName || '未知视频',
+                finalFlag,
+                finalEpisodeName,
+                body.episodeUrl || '',
+                finalSessionId,
+                finalState,
+                finalProgress,
+                body.revSort ? 1 : 0,
+                body.revPlay ? 1 : 0,
+                body.createTime || body.timestamp || Date.now(),
+                body.opening || 0,
+                body.ending || 0,
+                finalPosition,
+                finalDuration,
+                body.speed || 1.0,
+                body.scale || 0,
+                body.cid || 0,
+                finalCompleted ? 1 : 0,
+                webhookTimestamp
+            ]
         });
 
-        const client = getDB();
-        await client.batch(statements, "write");
-        console.log(`[Webhook 写入] 成功写入 ${statements.length} 条`);
-        res.status(200).json({ code: 0, message: `Synced ${statements.length} rows` });
+        console.log(`[Webhook 写入] 成功写入 dedupeKey="${dedupeKey}"`);
+        // 按文档 13.4.3 写入 API 响应格式
+        res.status(200).json({
+            code: 0,
+            success: true,
+            action: 'created',
+            affected: 1,
+            dedupeKey: dedupeKey,
+            configKey: configKey,
+            siteKey: body.siteKey || '',
+            vodId: body.vodId || '',
+            episodeName: finalEpisodeName,
+            message: 'Synced'
+        });
     } catch (err) {
         console.error("Webhook 写入失败:", err.message);
         res.status(500).json({ code: 500, message: err.message });
@@ -367,17 +425,23 @@ async function ensureDB() {
     try {
         const client = getDB();
 
-        // 1. 建表（含新字段）
+        // 创建新表：以 dedupeKey 为主键（文档要求用 dedupeKey 合并同一播放条目）
         await client.execute(`CREATE TABLE IF NOT EXISTS playback_history (
-            [key] TEXT PRIMARY KEY,
+            dedupeKey TEXT PRIMARY KEY,
+            eventId TEXT DEFAULT '',
             configKey TEXT DEFAULT '',
             configName TEXT DEFAULT '',
+            siteKey TEXT DEFAULT '',
             siteName TEXT DEFAULT '',
+            vodId TEXT DEFAULT '',
             vodPic TEXT,
             vodName TEXT,
-            vodFlag TEXT,
-            vodRemarks TEXT,
+            flag TEXT,
+            episodeName TEXT,
             episodeUrl TEXT,
+            sessionId TEXT DEFAULT '',
+            state TEXT DEFAULT '',
+            progress REAL DEFAULT 0.0,
             revSort INTEGER DEFAULT 0,
             revPlay INTEGER DEFAULT 0,
             createTime INTEGER DEFAULT 0,
@@ -387,24 +451,75 @@ async function ensureDB() {
             duration INTEGER DEFAULT 0,
             speed REAL DEFAULT 1.0,
             scale INTEGER DEFAULT 0,
-            cid INTEGER DEFAULT 0
+            cid INTEGER DEFAULT 0,
+            completed INTEGER DEFAULT 0,
+            webhookTimestamp INTEGER DEFAULT 0
         )`);
 
-        // 2. 兼容旧表：逐列尝试添加新字段
-        const migrations = [
-            "ALTER TABLE playback_history ADD COLUMN configKey TEXT DEFAULT ''",
-            "ALTER TABLE playback_history ADD COLUMN configName TEXT DEFAULT ''",
-            "ALTER TABLE playback_history ADD COLUMN siteName TEXT DEFAULT ''",
-        ];
+        // 为 eventId 创建索引（幂等查询用）
+        await client.execute(`CREATE INDEX IF NOT EXISTS idx_eventId ON playback_history(eventId)`);
+
+        // 兼容迁移：如果旧表有 [key] 列，尝试添加新列并迁移数据
+        // 先检查是否存在旧主键列 [key]
+        let hasOldKeyColumn = false;
+        try {
+            const tableInfo = await client.execute(`PRAGMA table_info(playback_history)`);
+            hasOldKeyColumn = tableInfo.rows && tableInfo.rows.some(r => r.name === 'key');
+        } catch (e) { /* 忽略 */ }
+
+        const migrations = [];
+        if (hasOldKeyColumn) {
+            // 旧表存在，需要迁移
+            // 先添加新列（如果不存在）
+            migrations.push(
+                "ALTER TABLE playback_history ADD COLUMN dedupeKey TEXT DEFAULT ''",
+                "ALTER TABLE playback_history ADD COLUMN eventId TEXT DEFAULT ''",
+                "ALTER TABLE playback_history ADD COLUMN siteKey TEXT DEFAULT ''",
+                "ALTER TABLE playback_history ADD COLUMN vodId TEXT DEFAULT ''",
+                "ALTER TABLE playback_history ADD COLUMN flag TEXT",
+                "ALTER TABLE playback_history ADD COLUMN episodeName TEXT",
+                "ALTER TABLE playback_history ADD COLUMN completed INTEGER DEFAULT 0",
+                "ALTER TABLE playback_history ADD COLUMN sessionId TEXT DEFAULT ''",
+                "ALTER TABLE playback_history ADD COLUMN state TEXT DEFAULT ''",
+                "ALTER TABLE playback_history ADD COLUMN progress REAL DEFAULT 0.0",
+                "ALTER TABLE playback_history ADD COLUMN webhookTimestamp INTEGER DEFAULT 0"
+            );
+        } else {
+            // 新表可能也缺少这些列（升级场景），也尝试添加
+            migrations.push(
+                "ALTER TABLE playback_history ADD COLUMN sessionId TEXT DEFAULT ''",
+                "ALTER TABLE playback_history ADD COLUMN state TEXT DEFAULT ''",
+                "ALTER TABLE playback_history ADD COLUMN progress REAL DEFAULT 0.0",
+                "ALTER TABLE playback_history ADD COLUMN webhookTimestamp INTEGER DEFAULT 0"
+            );
+        }
+
         for (const sql of migrations) {
             try { await client.execute(sql); } catch (e) { /* 字段已存在则忽略 */ }
+        }
+
+        // 如果有旧数据（key 列有值，dedupeKey 为空），尝试迁移
+        if (hasOldKeyColumn) {
+            try {
+                // 将旧 key 数据迁移到 dedupeKey，并将 vodRemarks 迁移到 episodeName
+                await client.execute(`
+                    UPDATE playback_history SET 
+                        dedupeKey = CASE WHEN dedupeKey = '' OR dedupeKey IS NULL THEN COALESCE([key], '') ELSE dedupeKey END,
+                        episodeName = CASE WHEN episodeName = '' OR episodeName IS NULL THEN COALESCE(vodRemarks, '') ELSE episodeName END,
+                        flag = CASE WHEN flag = '' OR flag IS NULL THEN COALESCE(vodFlag, '') ELSE flag END
+                    WHERE dedupeKey = '' OR dedupeKey IS NULL
+                `);
+                console.log('旧数据迁移完成');
+            } catch (e) {
+                console.log('旧数据迁移（可能无需迁移）:', e.message);
+            }
         }
 
         dbInitDone = true;
         console.log('数据库初始化成功');
     } catch (e) {
         console.error('数据库初始化失败:', e.message);
-        throw e; // 向上抛出让调用方知道
+        throw e;
     }
 }
 
@@ -412,12 +527,10 @@ async function ensureDB() {
 // 启动（本地开发时监听端口；Vercel serverless 自动导出 app）
 // =========================================================================
 if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
-    // 本地开发：预初始化数据库再监听端口
     ensureDB().then(() => {
         app.listen(PORT, () => { console.log(`同步服务已启动。端口: ${PORT}`); });
     }).catch(err => {
         console.error('启动失败，请检查 Turso 连接配置:', err.message);
-        // 即使初始化失败也启动，每个请求会重试
         app.listen(PORT, () => { console.log(`同步服务已启动（数据库待连接）。端口: ${PORT}`); });
     });
 }
