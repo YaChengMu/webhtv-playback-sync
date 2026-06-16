@@ -456,10 +456,8 @@ async function ensureDB() {
             webhookTimestamp INTEGER DEFAULT 0
         )`);
 
-        // 为 eventId 创建索引（幂等查询用）
-        await client.execute(`CREATE INDEX IF NOT EXISTS idx_eventId ON playback_history(eventId)`);
-
         // 兼容迁移：基于 PRAGMA table_info 检测所有缺失列并自动添加
+        // 注意：迁移必须在任何引用新列的 DDL（如 CREATE INDEX）之前执行
         let tableInfo = { rows: [] };
         try {
             const result = await client.execute(`PRAGMA table_info(playback_history)`);
