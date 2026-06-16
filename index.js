@@ -8,6 +8,8 @@ if (process.env.NODE_ENV !== 'production') {
 // Turso 客户端懒加载（Vercel serverless 兼容）
 // =========================================================================
 let db = null;
+let dbInitDone = false;
+
 function getDB() {
     if (!db) {
         const { createClient } = require('@libsql/client');
@@ -121,6 +123,7 @@ app.get('/', async (req, res) => {
     const configKey = req.headers['x-webhtv-config-key'] || '';
 
     try {
+        await ensureDB();
         const safeSql = `
             SELECT 
                 coalesce([key], '') as [key],
@@ -251,6 +254,7 @@ app.post('/api/webhook/playback', async (req, res) => {
     }
 
     try {
+        await ensureDB();
         const statements = validItems.map(item => {
             // 生成或使用 key
             if (!item.key) item.key = `${item.siteKey}_${item.vodId}`;
@@ -317,10 +321,13 @@ app.use((req, res) => { res.status(404).json({ code: 404, message: "Not found" }
 // =========================================================================
 // 数据库初始化
 // =========================================================================
-async function initDB() {
+async function ensureDB() {
+    if (dbInitDone) return;
+
     try {
         const client = getDB();
-        // 建表
+
+        // 1. 建表（含新字段）
         await client.execute(`CREATE TABLE IF NOT EXISTS playback_history (
             [key] TEXT PRIMARY KEY,
             configKey TEXT DEFAULT '',
@@ -343,7 +350,7 @@ async function initDB() {
             cid INTEGER DEFAULT 0
         )`);
 
-        // 兼容旧表：逐列尝试添加新字段
+        // 2. 兼容旧表：逐列尝试添加新字段
         const migrations = [
             "ALTER TABLE playback_history ADD COLUMN configKey TEXT DEFAULT ''",
             "ALTER TABLE playback_history ADD COLUMN configName TEXT DEFAULT ''",
@@ -352,8 +359,12 @@ async function initDB() {
         for (const sql of migrations) {
             try { await client.execute(sql); } catch (e) { /* 字段已存在则忽略 */ }
         }
+
+        dbInitDone = true;
+        console.log('数据库初始化成功');
     } catch (e) {
         console.error('数据库初始化失败:', e.message);
+        throw e; // 向上抛出让调用方知道
     }
 }
 
@@ -361,12 +372,14 @@ async function initDB() {
 // 启动（本地开发时监听端口；Vercel serverless 自动导出 app）
 // =========================================================================
 if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
-    initDB().then(() => {
+    // 本地开发：预初始化数据库再监听端口
+    ensureDB().then(() => {
         app.listen(PORT, () => { console.log(`同步服务已启动。端口: ${PORT}`); });
+    }).catch(err => {
+        console.error('启动失败，请检查 Turso 连接配置:', err.message);
+        // 即使初始化失败也启动，每个请求会重试
+        app.listen(PORT, () => { console.log(`同步服务已启动（数据库待连接）。端口: ${PORT}`); });
     });
-} else {
-    // Vercel serverless：首次请求时初始化
-    initDB();
 }
 
 module.exports = app;
