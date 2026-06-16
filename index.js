@@ -344,7 +344,7 @@ async function handleWebhookPlayback(req, res) {
                     revSort, revPlay, createTime, opening, ending,
                     position, duration, speed, scale, cid, completed,
                     webhookTimestamp
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(dedupeKey) DO UPDATE SET
                     eventId=excluded.eventId,
                     configKey=excluded.configKey, configName=excluded.configName,
