@@ -412,6 +412,38 @@ async function handleWebhookPlayback(req, res) {
 app.post('/', handleWebhookPlayback);
 
 // =========================================================================
+// 数据库重置接口 (DELETE /reset-db)
+// 删除 playback_history 表并重新初始化，用于清空所有数据
+// 需要携带有效的 X-WebHTV-Token（与正常鉴权一致）
+// =========================================================================
+app.delete('/reset-db', async (req, res) => {
+    try {
+        await ensureDB();
+        const client = getDB();
+
+        // 先删除索引
+        try { await client.execute(`DROP INDEX IF EXISTS idx_eventId`); } catch (e) { /* 忽略 */ }
+
+        // 删除旧表
+        await client.execute(`DROP TABLE IF EXISTS playback_history`);
+
+        // 重置初始化标记，让 ensureDB 重新建表
+        dbInitDone = false;
+        await ensureDB();
+
+        console.log('[重置] 数据库已重置，playback_history 表已重建');
+        res.status(200).json({
+            code: 0,
+            success: true,
+            message: 'Database reset successfully. All playback history has been cleared.'
+        });
+    } catch (err) {
+        console.error('数据库重置失败:', err.message);
+        res.status(500).json({ code: 500, message: `Reset failed: ${err.message}` });
+    }
+});
+
+// =========================================================================
 // 404 兜底
 // =========================================================================
 app.use((req, res) => { res.status(404).json({ code: 404, message: "Not found" }); });
