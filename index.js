@@ -251,11 +251,12 @@ app.get('/', async (req, res) => {
 });
 
 // =========================================================================
-// Webhook 接收端点 (POST /api/webhook/playback)
+// Webhook 接收端点 (POST / 和 POST /api/webhook/playback)
 // 文档 13.4.5：App POST 单条播放记录，字段如 schema/event/eventId/siteKey/vodId/positionMs 等
 // 服务端按 token + configKey 分组，用 key = siteKey_vodId 做主键去重
+// 部分 App 版本可能 POST 到根路径 /，因此同时注册两个路由
 // =========================================================================
-app.post('/api/webhook/playback', async (req, res) => {
+async function handleWebhookPlayback(req, res) {
     const configKey = (req.headers['x-webhtv-config-key'] || '').trim();
     const configName = (req.headers['x-webhtv-config-name'] || '').trim();
     const body = req.body || {};
@@ -348,7 +349,9 @@ app.post('/api/webhook/playback', async (req, res) => {
         console.error("Webhook 写入失败:", err.message);
         res.status(500).json({ code: 500, message: err.message });
     }
-});
+}
+
+app.post('/', handleWebhookPlayback);
 
 // =========================================================================
 // 404 兜底
