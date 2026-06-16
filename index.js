@@ -459,44 +459,67 @@ async function ensureDB() {
         // 为 eventId 创建索引（幂等查询用）
         await client.execute(`CREATE INDEX IF NOT EXISTS idx_eventId ON playback_history(eventId)`);
 
-        // 兼容迁移：如果旧表有 [key] 列，尝试添加新列并迁移数据
-        // 先检查是否存在旧主键列 [key]
-        let hasOldKeyColumn = false;
+        // 兼容迁移：基于 PRAGMA table_info 检测所有缺失列并自动添加
+        let tableInfo = { rows: [] };
         try {
-            const tableInfo = await client.execute(`PRAGMA table_info(playback_history)`);
-            hasOldKeyColumn = tableInfo.rows && tableInfo.rows.some(r => r.name === 'key');
+            const result = await client.execute(`PRAGMA table_info(playback_history)`);
+            tableInfo = result;
         } catch (e) { /* 忽略 */ }
+        const existingColumns = new Set((tableInfo.rows || []).map(r => r.name));
 
-        const migrations = [];
-        if (hasOldKeyColumn) {
-            // 旧表存在，需要迁移
-            // 先添加新列（如果不存在）
-            migrations.push(
-                "ALTER TABLE playback_history ADD COLUMN dedupeKey TEXT DEFAULT ''",
-                "ALTER TABLE playback_history ADD COLUMN eventId TEXT DEFAULT ''",
-                "ALTER TABLE playback_history ADD COLUMN siteKey TEXT DEFAULT ''",
-                "ALTER TABLE playback_history ADD COLUMN vodId TEXT DEFAULT ''",
-                "ALTER TABLE playback_history ADD COLUMN flag TEXT",
-                "ALTER TABLE playback_history ADD COLUMN episodeName TEXT",
-                "ALTER TABLE playback_history ADD COLUMN completed INTEGER DEFAULT 0",
-                "ALTER TABLE playback_history ADD COLUMN sessionId TEXT DEFAULT ''",
-                "ALTER TABLE playback_history ADD COLUMN state TEXT DEFAULT ''",
-                "ALTER TABLE playback_history ADD COLUMN progress REAL DEFAULT 0.0",
-                "ALTER TABLE playback_history ADD COLUMN webhookTimestamp INTEGER DEFAULT 0"
-            );
-        } else {
-            // 新表可能也缺少这些列（升级场景），也尝试添加
-            migrations.push(
-                "ALTER TABLE playback_history ADD COLUMN sessionId TEXT DEFAULT ''",
-                "ALTER TABLE playback_history ADD COLUMN state TEXT DEFAULT ''",
-                "ALTER TABLE playback_history ADD COLUMN progress REAL DEFAULT 0.0",
-                "ALTER TABLE playback_history ADD COLUMN webhookTimestamp INTEGER DEFAULT 0"
-            );
+        const hasOldKeyColumn = existingColumns.has('key');
+
+        // 目标列定义：列名 -> DDL 片段
+        const targetColumns = {
+            dedupeKey:        "TEXT DEFAULT ''",
+            eventId:          "TEXT DEFAULT ''",
+            configKey:        "TEXT DEFAULT ''",
+            configName:       "TEXT DEFAULT ''",
+            siteKey:          "TEXT DEFAULT ''",
+            siteName:         "TEXT DEFAULT ''",
+            vodId:            "TEXT DEFAULT ''",
+            vodPic:           "TEXT",
+            vodName:          "TEXT",
+            flag:             "TEXT",
+            episodeName:      "TEXT",
+            episodeUrl:       "TEXT",
+            sessionId:        "TEXT DEFAULT ''",
+            state:            "TEXT DEFAULT ''",
+            progress:         "REAL DEFAULT 0.0",
+            revSort:          "INTEGER DEFAULT 0",
+            revPlay:          "INTEGER DEFAULT 0",
+            createTime:       "INTEGER DEFAULT 0",
+            opening:          "INTEGER DEFAULT 0",
+            ending:           "INTEGER DEFAULT 0",
+            position:         "INTEGER DEFAULT 0",
+            duration:         "INTEGER DEFAULT 0",
+            speed:            "REAL DEFAULT 1.0",
+            scale:            "INTEGER DEFAULT 0",
+            cid:              "INTEGER DEFAULT 0",
+            completed:        "INTEGER DEFAULT 0",
+            webhookTimestamp: "INTEGER DEFAULT 0"
+        };
+
+        const addedColumns = [];
+        for (const [colName, colDef] of Object.entries(targetColumns)) {
+            if (!existingColumns.has(colName)) {
+                const sql = `ALTER TABLE playback_history ADD COLUMN ${colName} ${colDef}`;
+                try {
+                    await client.execute(sql);
+                    addedColumns.push(colName);
+                } catch (e) {
+                    console.log(`[迁移] 添加列 ${colName} 失败（可能已存在）: ${e.message}`);
+                }
+            }
+        }
+        if (addedColumns.length > 0) {
+            console.log(`[迁移] 已添加 ${addedColumns.length} 个缺失列: ${addedColumns.join(', ')}`);
         }
 
-        for (const sql of migrations) {
-            try { await client.execute(sql); } catch (e) { /* 字段已存在则忽略 */ }
-        }
+        // 为 eventId 创建索引（幂等查询用）
+        try {
+            await client.execute(`CREATE INDEX IF NOT EXISTS idx_eventId ON playback_history(eventId)`);
+        } catch (e) { /* 忽略 */ }
 
         // 如果有旧数据（key 列有值，dedupeKey 为空），尝试迁移
         if (hasOldKeyColumn) {
