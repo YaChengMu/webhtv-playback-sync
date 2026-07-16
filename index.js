@@ -259,8 +259,9 @@ app.get('/', async (req, res) => {
 // Webhook 接收端点 (POST /)
 // 文档 13.4.5：
 //   - schema 校验 "webhtv.playback.v1"
-//   - 区分 playback.progress / playback.ended 事件
-//   - 用 dedupeKey 做主键（同一播放条目合并）
+//   - 区分 playback.progress / playback.ended / playback.deleted 事件
+//   - playback.progress / playback.ended：用 dedupeKey 做主键（同一播放条目合并）
+//   - playback.deleted：按 dedupeKey 删除对应播放条目
 //   - 用 eventId / Idempotency-Key 做幂等去重
 //   - configKey 优先从 body 取，header 作为 fallback
 // =========================================================================
@@ -332,6 +333,27 @@ async function handleWebhookPlayback(req, res) {
         if (existing.rows && existing.rows.length > 0) {
             console.log(`[Webhook] eventId="${eventId}" 已处理过，跳过（幂等）`);
             return res.status(200).json({ code: 0, message: "Already processed (idempotent)", skipped: true });
+        }
+
+        // === playback.deleted：按 dedupeKey 删除对应播放条目 ===
+        // App 在本地删除历史时推送该事件；与进度/完播事件共用同一 dedupeKey，
+        // 可精准定位并移除，避免服务端保留已删除记录、并在后续拉取时重新推回设备。
+        // 若服务端本就无此条目（例如该记录从未上报过），DELETE 影响 0 行，无害。
+        if (event === 'playback.deleted') {
+            const del = await client.execute({
+                sql: `DELETE FROM playback_history WHERE dedupeKey = ?`,
+                args: [dedupeKey]
+            });
+            console.log(`[Webhook 删除] dedupeKey="${dedupeKey}" affected=${del.rowsAffected || 0}`);
+            return res.status(200).json({
+                code: 0,
+                success: true,
+                action: 'deleted',
+                affected: del.rowsAffected || 0,
+                dedupeKey: dedupeKey,
+                configKey: configKey,
+                message: 'Deleted'
+            });
         }
 
         // 写入：用 dedupeKey 做主键，同一播放条目合并更新
