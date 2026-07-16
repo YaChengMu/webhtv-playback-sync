@@ -161,7 +161,8 @@ app.get('/', async (req, res) => {
                 coalesce(completed, 0) as completed,
                 coalesce(eventId, '') as eventId,
                 coalesce(webhookTimestamp, 0) as webhookTimestamp
-            FROM playback_history 
+            FROM playback_history
+            WHERE (deletedAt IS NULL OR deletedAt = 0)
             ORDER BY createTime DESC
         `;
 
@@ -240,9 +241,33 @@ app.get('/', async (req, res) => {
         const lastItem = items.length > 0 ? items[items.length - 1] : null;
         const nextSince = lastItem ? lastItem.updatedAt : 0;
 
+        // 墓碑：返回已被软删除的 dedupeKey，供客户端直接按身份匹配并清理本地副本。
+        // 仅返回与当前 configKey 匹配的墓碑（空 configKey 为兼容旧数据，一并返回）。
+        let deleted = [];
+        try {
+            const delWhere = configKey
+                ? `(deletedAt > 0 AND (configKey = '' OR configKey = ?))`
+                : `(deletedAt > 0)`;
+            const delArgs = configKey ? [configKey] : [];
+            const delResult = await client.execute({
+                sql: `SELECT dedupeKey FROM playback_history WHERE ${delWhere}`,
+                args: delArgs
+            });
+            deleted = (delResult.rows || []).map(r => r.dedupeKey).filter(k => k);
+            // 清理 90 天前的墓碑，避免无限增长（超过该期限的删除事件不再需要向下游传播）
+            const purgeBefore = Date.now() - 90 * 24 * 3600 * 1000;
+            await client.execute({
+                sql: `DELETE FROM playback_history WHERE deletedAt > 0 AND deletedAt < ?`,
+                args: [purgeBefore]
+            });
+        } catch (e) {
+            console.error('[远端同步] 读取墓碑失败:', e.message);
+        }
+
         const response = {
             items: items,
-            nextSince: nextSince
+            nextSince: nextSince,
+            deleted: deleted
         };
 
         console.log(`[远端同步] 最终返回 items=${items.length} nextSince=${nextSince}`);
@@ -340,16 +365,47 @@ async function handleWebhookPlayback(req, res) {
         // 可精准定位并移除，避免服务端保留已删除记录、并在后续拉取时重新推回设备。
         // 若服务端本就无此条目（例如该记录从未上报过），DELETE 影响 0 行，无害。
         if (event === 'playback.deleted') {
+            // 软删除：保留墓碑（deletedAt 时间戳），供后续拉取时通过 deleted 列表向下游设备传播删除。
+            // 若服务端本就无此条目（例如该记录从未上报过），UPDATE 影响 0 行，无害。
+            const now = Date.now();
             const del = await client.execute({
-                sql: `DELETE FROM playback_history WHERE dedupeKey = ?`,
-                args: [dedupeKey]
+                sql: `UPDATE playback_history SET deletedAt = ? WHERE dedupeKey = ?`,
+                args: [now, dedupeKey]
             });
-            console.log(`[Webhook 删除] dedupeKey="${dedupeKey}" affected=${del.rowsAffected || 0}`);
+            let affected = del.rowsAffected || 0;
+            let matchedBy = 'dedupeKey';
+            console.log(`[Webhook 删除] dedupeKey="${dedupeKey}" affected=${affected}`);
+
+            // 兜底软删除：dedupeKey 由客户端基于易变字段（如 episodeUrl / flag）计算，
+            // 写入进度时与删除时可能不一致，导致按 dedupeKey 删不中。
+            // 此时改用稳定身份字段（configKey + siteKey + vodId）兜底软删除同一 vod 的所有条目。
+            // 要求至少携带 vodId，避免误删。
+            if (affected === 0) {
+                const fbVodId = String(body.vodId || '').trim();
+                const fbSiteKey = String(body.siteKey || '').trim();
+                const fbConfigKey = String(configKey || '').trim();
+                if (fbVodId) {
+                    const conds = ['vodId = ?'];
+                    const args = [fbVodId];
+                    if (fbSiteKey) { conds.push('siteKey = ?'); args.push(fbSiteKey); }
+                    // configKey 匹配当前值或空（兼容旧服务端写入的空 configKey 记录）
+                    if (fbConfigKey) { conds.push("(configKey = ? OR configKey = '')"); args.push(fbConfigKey); }
+                    const fbDel = await client.execute({
+                        sql: `UPDATE playback_history SET deletedAt = ? WHERE ${conds.join(' AND ')}`,
+                        args: [now, ...args]
+                    });
+                    affected = fbDel.rowsAffected || 0;
+                    matchedBy = 'identity';
+                    console.log(`[Webhook 删除-兜底] siteKey="${fbSiteKey}" vodId="${fbVodId}" configKey="${fbConfigKey}" affected=${affected}`);
+                }
+            }
+
             return res.status(200).json({
                 code: 0,
                 success: true,
                 action: 'deleted',
-                affected: del.rowsAffected || 0,
+                affected: affected,
+                matchedBy: matchedBy,
                 dedupeKey: dedupeKey,
                 configKey: configKey,
                 message: 'Deleted'
@@ -379,6 +435,7 @@ async function handleWebhookPlayback(req, res) {
                     position=excluded.position, duration=excluded.duration,
                     speed=excluded.speed, scale=excluded.scale, cid=excluded.cid,
                     completed=excluded.completed,
+                    deletedAt=0,
                     webhookTimestamp=excluded.webhookTimestamp`,
             args: [
                 dedupeKey,
@@ -507,6 +564,7 @@ async function ensureDB() {
             scale INTEGER DEFAULT 0,
             cid INTEGER DEFAULT 0,
             completed INTEGER DEFAULT 0,
+            deletedAt INTEGER DEFAULT 0,
             webhookTimestamp INTEGER DEFAULT 0
         )`);
 
@@ -553,6 +611,7 @@ async function ensureDB() {
             scale:            "INTEGER DEFAULT 0",
             cid:              "INTEGER DEFAULT 0",
             completed:        "INTEGER DEFAULT 0",
+            deletedAt:        "INTEGER DEFAULT 0",
             webhookTimestamp: "INTEGER DEFAULT 0"
         };
 
@@ -615,6 +674,7 @@ async function ensureDB() {
                 scale INTEGER DEFAULT 0,
                 cid INTEGER DEFAULT 0,
                 completed INTEGER DEFAULT 0,
+                deletedAt INTEGER DEFAULT 0,
                 webhookTimestamp INTEGER DEFAULT 0
             )`);
             await client.execute(`INSERT INTO playback_history_new (${colList}) SELECT ${colList} FROM playback_history`);
