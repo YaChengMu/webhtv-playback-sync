@@ -365,47 +365,25 @@ async function handleWebhookPlayback(req, res) {
         // 可精准定位并移除，避免服务端保留已删除记录、并在后续拉取时重新推回设备。
         // 若服务端本就无此条目（例如该记录从未上报过），DELETE 影响 0 行，无害。
         if (event === 'playback.deleted') {
-            // 软删除：保留墓碑（deletedAt 时间戳），供后续拉取时通过 deleted 列表向下游设备传播删除。
+            // 按文档 13.4.5：服务端只认 App 发来的 dedupeKey，用它精准定位并软删除。
+            // dedupeKey 由 App 基于稳定字段（接口/站点/影片，不含 token、不含易变的
+            // episodeUrl/集数）计算，同一视频上传与删除恒定同 key，因此无需服务端再
+            // 用 vodId/siteKey 等字段二次推导身份——那属于在错误层级打补丁。
+            // 软删除保留墓碑（deletedAt 时间戳），供后续拉取时通过 deleted 列表向下游设备传播删除。
             // 若服务端本就无此条目（例如该记录从未上报过），UPDATE 影响 0 行，无害。
             const now = Date.now();
             const del = await client.execute({
                 sql: `UPDATE playback_history SET deletedAt = ? WHERE dedupeKey = ?`,
                 args: [now, dedupeKey]
             });
-            let affected = del.rowsAffected || 0;
-            let matchedBy = 'dedupeKey';
+            const affected = del.rowsAffected || 0;
             console.log(`[Webhook 删除] dedupeKey="${dedupeKey}" affected=${affected}`);
-
-            // 兜底软删除：dedupeKey 由客户端基于易变字段（如 episodeUrl / flag）计算，
-            // 写入进度时与删除时可能不一致，导致按 dedupeKey 删不中。
-            // 此时改用稳定身份字段（configKey + siteKey + vodId）兜底软删除同一 vod 的所有条目。
-            // 要求至少携带 vodId，避免误删。
-            if (affected === 0) {
-                const fbVodId = String(body.vodId || '').trim();
-                const fbSiteKey = String(body.siteKey || '').trim();
-                const fbConfigKey = String(configKey || '').trim();
-                if (fbVodId) {
-                    const conds = ['vodId = ?'];
-                    const args = [fbVodId];
-                    if (fbSiteKey) { conds.push('siteKey = ?'); args.push(fbSiteKey); }
-                    // configKey 匹配当前值或空（兼容旧服务端写入的空 configKey 记录）
-                    if (fbConfigKey) { conds.push("(configKey = ? OR configKey = '')"); args.push(fbConfigKey); }
-                    const fbDel = await client.execute({
-                        sql: `UPDATE playback_history SET deletedAt = ? WHERE ${conds.join(' AND ')}`,
-                        args: [now, ...args]
-                    });
-                    affected = fbDel.rowsAffected || 0;
-                    matchedBy = 'identity';
-                    console.log(`[Webhook 删除-兜底] siteKey="${fbSiteKey}" vodId="${fbVodId}" configKey="${fbConfigKey}" affected=${affected}`);
-                }
-            }
 
             return res.status(200).json({
                 code: 0,
                 success: true,
                 action: 'deleted',
                 affected: affected,
-                matchedBy: matchedBy,
                 dedupeKey: dedupeKey,
                 configKey: configKey,
                 message: 'Deleted'
