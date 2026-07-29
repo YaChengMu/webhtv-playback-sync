@@ -365,19 +365,32 @@ async function handleWebhookPlayback(req, res) {
         // 可精准定位并移除，避免服务端保留已删除记录、并在后续拉取时重新推回设备。
         // 若服务端本就无此条目（例如该记录从未上报过），DELETE 影响 0 行，无害。
         if (event === 'playback.deleted') {
-            // 按文档 13.4.5：服务端只认 App 发来的 dedupeKey，用它精准定位并软删除。
-            // dedupeKey 由 App 基于稳定字段（接口/站点/影片，不含 token、不含易变的
-            // episodeUrl/集数）计算，同一视频上传与删除恒定同 key，因此无需服务端再
-            // 用 vodId/siteKey 等字段二次推导身份——那属于在错误层级打补丁。
             // 软删除保留墓碑（deletedAt 时间戳），供后续拉取时通过 deleted 列表向下游设备传播删除。
-            // 若服务端本就无此条目（例如该记录从未上报过），UPDATE 影响 0 行，无害。
             const now = Date.now();
+
+            // 本地历史把同一部剧（同一源）的全部分集合并成一行，删除时仅以"最新一集"身份
+            // 发起删除；但服务端按分集 dedupeKey 分别存储，若只按精确 dedupeKey 删除，仅
+            // 移除最新一集，其余分集的远端播放记录会残留，表现为"删不干净、需多次删除"。
+            // 因此除精确 dedupeKey 外，再按"源级身份"(configKey + siteKey + vodId)做范围
+            // 软删除，一次性清理该源下全部分集的播放记录。三个字段齐备才启用范围删除，
+            // 避免 configKey 缺失时误删其它来源的记录。
+            const sourceCols = [];
+            const sourceArgs = [];
+            if (configKey) { sourceCols.push('configKey = ?'); sourceArgs.push(configKey); }
+            if (body.siteKey) { sourceCols.push('siteKey = ?'); sourceArgs.push(body.siteKey); }
+            if (body.vodId) { sourceCols.push('vodId = ?'); sourceArgs.push(body.vodId); }
+
+            let sql = `UPDATE playback_history SET deletedAt = ? WHERE dedupeKey = ?`;
+            if (sourceCols.length === 3) {
+                sql += ` OR (${sourceCols.join(' AND ')})`;
+            }
+
             const del = await client.execute({
-                sql: `UPDATE playback_history SET deletedAt = ? WHERE dedupeKey = ?`,
-                args: [now, dedupeKey]
+                sql: sql,
+                args: [now, dedupeKey, ...sourceArgs]
             });
             const affected = del.rowsAffected || 0;
-            console.log(`[Webhook 删除] dedupeKey="${dedupeKey}" affected=${affected}`);
+            console.log(`[Webhook 删除] dedupeKey="${dedupeKey}" sourceArgs=${JSON.stringify(sourceArgs)} affected=${affected}`);
 
             return res.status(200).json({
                 code: 0,
@@ -681,6 +694,11 @@ async function ensureDB() {
         // 为 eventId 创建索引（幂等查询用）
         try {
             await client.execute(`CREATE INDEX IF NOT EXISTS idx_eventId ON playback_history(eventId)`);
+        } catch (e) { /* 忽略 */ }
+
+        // 源级身份复合索引：加速 playback.deleted 按 (configKey, siteKey, vodId) 范围软删除
+        try {
+            await client.execute(`CREATE INDEX IF NOT EXISTS idx_source ON playback_history(configKey, siteKey, vodId)`);
         } catch (e) { /* 忽略 */ }
 
         dbInitDone = true;
