@@ -111,11 +111,11 @@ async function ensureDB() {
     token TEXT NOT NULL DEFAULT '',
     configKey TEXT NOT NULL DEFAULT '',
     scope TEXT NOT NULL,
-    historyKey TEXT,
-    siteKey TEXT,
-    vodId TEXT,
+    historyKey TEXT NOT NULL DEFAULT '',
+    siteKey TEXT NOT NULL DEFAULT '',
+    vodId TEXT NOT NULL DEFAULT '',
     deletedAt INTEGER NOT NULL,
-    UNIQUE(token, configKey, scope, COALESCE(historyKey, ''), COALESCE(siteKey, ''), COALESCE(vodId, ''))
+    UNIQUE(token, configKey, scope, historyKey, siteKey, vodId)
   )`);
   await c.execute(`CREATE INDEX IF NOT EXISTS idx_ts_token_config ON tombstones(token, configKey)`);
   await c.execute(`CREATE INDEX IF NOT EXISTS idx_ts_deletedAt ON tombstones(deletedAt)`);
@@ -254,13 +254,14 @@ async function upsertHistory(c, token, dedupeKey, configKey, payload) {
 }
 
 async function addTombstone(c, token, configKey, scope, locator, deletedAt) {
-  const historyKey = locator.historyKey || null;
-  const siteKey = locator.siteKey || null;
-  const vodId = locator.vodId || null;
+  // null 统一转为 ''，配合列 DEFAULT '' 让空值也能参与 UNIQUE 约束
+  const historyKey = locator.historyKey ? String(locator.historyKey) : '';
+  const siteKey = locator.siteKey ? String(locator.siteKey) : '';
+  const vodId = locator.vodId ? String(locator.vodId) : '';
   await c.execute({
     sql: `INSERT INTO tombstones (token, configKey, scope, historyKey, siteKey, vodId, deletedAt)
           VALUES (?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(token, configKey, scope, COALESCE(historyKey, ''), COALESCE(siteKey, ''), COALESCE(vodId, ''))
+          ON CONFLICT(token, configKey, scope, historyKey, siteKey, vodId)
           DO UPDATE SET deletedAt = excluded.deletedAt
           WHERE excluded.deletedAt > tombstones.deletedAt`,
     args: [token, configKey, scope, historyKey, siteKey, vodId, num(deletedAt)]
