@@ -435,7 +435,8 @@ async function handleSyncSource(req, res) {
 // =========================================================================
 app.use(express.json({ limit: '1mb' }));
 
-app.options('/api/playback/sync', (req, res) => {
+// 统一使用根路径 / 作为同步端点（App 端"远端同步"和"Webhook 上报"均填域名根）
+app.options('/', (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.set('Access-Control-Allow-Headers',
@@ -444,8 +445,8 @@ app.options('/api/playback/sync', (req, res) => {
   res.status(204).end();
 });
 
-app.get('/api/playback/sync', requireAuth, requireConfigKey, handleSyncSource);
-app.post('/api/playback/sync', requireAuth, requireConfigKey, handleWebhook);
+app.get('/', requireAuth, requireConfigKey, handleSyncSource);
+app.post('/', requireAuth, requireConfigKey, handleWebhook);
 
 // =========================================================================
 // 数据库重置接口 (DELETE /reset-db)
@@ -470,7 +471,7 @@ app.delete('/reset-db', requireAuth, async (req, res) => {
 // =========================================================================
 // 健康检查
 // =========================================================================
-app.get('/', async (req, res) => {
+app.get('/health', async (req, res) => {
   try {
     await withDB(async () => {});
     res.status(200).json({ code: 0, status: 'ok', message: 'WebHTV playback sync service is running.' });
