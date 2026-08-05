@@ -304,6 +304,18 @@ async function applyDelete(c, token, configKey, scope, locator, deletedAt) {
 }
 
 // =========================================================================
+// 请求日志：打印方法、路径、请求头（脱敏 token）与 body
+// =========================================================================
+function logRequest(req) {
+  const headers = { ...req.headers };
+  if (headers['x-webhtv-token']) headers['x-webhtv-token'] = '***';
+  if (headers.authorization) headers.authorization = '***';
+  console.log(`[请求] ${req.method} ${req.originalUrl}`);
+  console.log('  请求头:', JSON.stringify(headers));
+  console.log('  请求体:', JSON.stringify(req.body));
+}
+
+// =========================================================================
 // Webhook 接收（POST）
 // =========================================================================
 async function handleWebhook(req, res) {
@@ -434,6 +446,13 @@ async function handleSyncSource(req, res) {
 // 路由
 // =========================================================================
 app.use(express.json({ limit: '1mb' }));
+// 请求日志（打印方法、路径、请求头与请求体，token 脱敏；跳过预检与健康检查）
+app.use((req, res, next) => {
+  if (req.method !== 'OPTIONS' && req.originalUrl !== '/health') {
+    logRequest(req);
+  }
+  next();
+});
 
 // 统一使用根路径 / 作为同步端点（App 端"远端同步"和"Webhook 上报"均填域名根）
 app.options('/', (req, res) => {
