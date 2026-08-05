@@ -33,6 +33,42 @@ function getDB() {
 
 // 建表（幂等，带版本迁移）
 let dbInitDone = false;
+async function migrateOldTable(c) {
+  // 旧表可能缺 token 等新列，补充后再用，避免"no such column"错误
+  try {
+    const { rows } = await c.execute(`SELECT name FROM pragma_table_info('playback_history')`);
+    const existing = new Set(rows.map(r => r.name));
+    if (!existing.has('token')) {
+      await c.execute(`ALTER TABLE playback_history ADD COLUMN token TEXT NOT NULL DEFAULT ''`);
+      existing.add('token');
+    }
+    if (!existing.has('configKey')) {
+      await c.execute(`ALTER TABLE playback_history ADD COLUMN configKey TEXT NOT NULL DEFAULT ''`);
+      existing.add('configKey');
+    }
+    if (!existing.has('updatedAt')) {
+      await c.execute(`ALTER TABLE playback_history ADD COLUMN updatedAt INTEGER NOT NULL DEFAULT 0`);
+      existing.add('updatedAt');
+    }
+    if (!existing.has('speedOverride')) {
+      await c.execute(`ALTER TABLE playback_history ADD COLUMN speedOverride BOOLEAN DEFAULT 0`);
+      existing.add('speedOverride');
+    }
+    if (!existing.has('speed')) {
+      await c.execute(`ALTER TABLE playback_history ADD COLUMN speed REAL DEFAULT 1.0`);
+      existing.add('speed');
+    }
+    if (!existing.has('positionMs')) {
+      await c.execute(`ALTER TABLE playback_history ADD COLUMN positionMs INTEGER DEFAULT 0`);
+    }
+    if (!existing.has('durationMs')) {
+      await c.execute(`ALTER TABLE playback_history ADD COLUMN durationMs INTEGER DEFAULT 0`);
+    }
+  } catch (e) {
+    // 表不存在等情况交给 ensureDB 处理
+  }
+}
+
 async function ensureDB() {
   if (dbInitDone) return;
   const c = getDB();
@@ -90,7 +126,24 @@ async function ensureDB() {
 async function withDB(cb) {
   if (!dbReady) dbReady = ensureDB();
   await dbReady;
-  return cb(getDB());
+  const c = getDB();
+  // 旧库自愈：补充缺失列，避免 "no such column" 错误
+  await migrateOldTable(c);
+  return cb(c);
+}
+
+// 强制重建：清空 withDB 的缓存，确保 DDL 真正执行（用于 reset-db）
+async function rebuildDB() {
+  dbReady = null;
+  dbInitDone = false;
+  const c = getDB();
+  try { await c.execute(`DROP INDEX IF EXISTS idx_ph_token_config`); } catch (e) {}
+  try { await c.execute(`DROP INDEX IF EXISTS idx_ph_updatedAt`); } catch (e) {}
+  try { await c.execute(`DROP INDEX IF EXISTS idx_ts_token_config`); } catch (e) {}
+  try { await c.execute(`DROP INDEX IF EXISTS idx_ts_deletedAt`); } catch (e) {}
+  await c.execute(`DROP TABLE IF EXISTS playback_history`);
+  await c.execute(`DROP TABLE IF EXISTS tombstones`);
+  await ensureDB();
 }
 
 // =========================================================================
@@ -400,16 +453,7 @@ app.post('/api/playback/sync', requireAuth, requireConfigKey, handleWebhook);
 // =========================================================================
 app.delete('/reset-db', requireAuth, async (req, res) => {
   try {
-    await withDB(async (c) => {
-      try { await c.execute(`DROP INDEX IF EXISTS idx_ph_token_config`); } catch (e) { /* 忽略 */ }
-      try { await c.execute(`DROP INDEX IF EXISTS idx_ph_updatedAt`); } catch (e) { /* 忽略 */ }
-      try { await c.execute(`DROP INDEX IF EXISTS idx_ts_token_config`); } catch (e) { /* 忽略 */ }
-      try { await c.execute(`DROP INDEX IF EXISTS idx_ts_deletedAt`); } catch (e) { /* 忽略 */ }
-      await c.execute(`DROP TABLE IF EXISTS playback_history`);
-      await c.execute(`DROP TABLE IF EXISTS tombstones`);
-      dbInitDone = false;
-      await ensureDB();
-    });
+    await rebuildDB();
     console.log('[重置] 数据库已重置，playback_history 与 tombstones 表已重建');
     res.status(200).json({
       code: 0,
