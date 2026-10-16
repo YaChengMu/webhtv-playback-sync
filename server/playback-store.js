@@ -10,6 +10,7 @@ import { createClient } from '@libsql/client';
  * keeps SQLite free of SQLITE_BUSY on a local single-writer database. The
  * caller already retries on a failed CAS (MAX_CAS_ATTEMPTS).
  */
+
 export function createLibsqlPlaybackStore(url, authToken) {
   const client = createClient({ url, authToken });
 
@@ -18,12 +19,6 @@ export function createLibsqlPlaybackStore(url, authToken) {
       key TEXT PRIMARY KEY,
       state TEXT NOT NULL
     )`);
-    // Reduce lock contention on a local single-writer database.
-    try {
-      await client.execute(`PRAGMA busy_timeout = 5000`);
-    } catch (err) {
-      console.warn('playback-store: unable to set busy_timeout', err && err.message ? err.message : err);
-    }
   }
 
   async function reset() {
