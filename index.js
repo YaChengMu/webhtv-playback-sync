@@ -1,4 +1,6 @@
 import { createClient } from '@libsql/client';
+// Load local .env in development. On Vercel the platform injects env vars at
+// runtime. dotenv is a production dependency, so this never fails to resolve.
 import 'dotenv/config';
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -60,9 +62,17 @@ export default async function handler(req, res) {
 
     // Keep the management endpoints outside the playback handler.
     if (pathname === '/health') {
+      const usingRemote = /^libsql:|^https?:/i.test(TURSO_DATABASE_URL);
       res.statusCode = 200;
       res.setHeader('content-type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify({ code: 0, status: 'ok', message: 'WebHTV playback sync service is running.' }));
+      res.end(JSON.stringify({
+        code: 0,
+        status: 'ok',
+        message: 'WebHTV playback sync service is running.',
+        storage: usingRemote ? 'remote' : 'local-file',
+        persistent: usingRemote,
+        warning: usingRemote ? '' : 'local-file storage is ephemeral on serverless platforms (Vercel); configure TURSO_DATABASE_URL for persistence'
+      }));
       return;
     }
     if (req.method === 'DELETE' && pathname === '/reset-db') {

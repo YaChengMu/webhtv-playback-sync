@@ -19,10 +19,10 @@
   "author": "IsayIsee",
   "license": "MIT",
   "dependencies": {
-    "@libsql/client": "^0.14.0"
+    "@libsql/client": "^0.14.0",
+    "dotenv": "^16.4.5"
   },
   "devDependencies": {
-    "dotenv": "^16.4.5"
   },
   "engines": {
     "node": ">=18.0.0"
