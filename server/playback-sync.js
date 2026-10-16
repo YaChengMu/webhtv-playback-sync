@@ -13,13 +13,6 @@ const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
 const MAX_CAS_ATTEMPTS = 5;
 
-export function isPlaybackSyncPath(pathname) {
-  const path = normalizePath(pathname);
-  if (PLAYBACK_SYNC_PATHS.has(path)) return true;
-  for (const base of PLAYBACK_SYNC_PATHS) if (path === `${base}/status`) return true;
-  return IDENTITY_RESOLVE_PATHS.has(path);
-}
-
 export async function handlePlaybackSyncRequest(request, store) {
   if (request.method === 'OPTIONS') return playbackCors(new Response(null, { status: 204 }));
   try {
@@ -59,27 +52,6 @@ export async function handlePlaybackSyncRequest(request, store) {
     console.error('Playback sync request failed', error && error.stack ? error.stack : error);
     return playbackError(500, 'Internal server error');
   }
-}
-
-export function createMemoryPlaybackStore() {
-  const entries = new Map();
-  return {
-    persistent: false,
-    isConfigured: () => true,
-    async load(key) {
-      const entry = entries.get(key);
-      return entry
-        ? { version: entry.version, state: cloneJson(entry.state) }
-        : { version: null, state: null };
-    },
-    async compareAndSet(key, version, state) {
-      const entry = entries.get(key);
-      const current = entry ? entry.version : null;
-      if (current !== version) return false;
-      entries.set(key, { version: (current || 0) + 1, state: cloneJson(state) });
-      return true;
-    }
-  };
 }
 
 async function ingestPlayback(request, store, token) {
