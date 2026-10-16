@@ -2,7 +2,7 @@ import { webcrypto } from 'node:crypto';
 const crypto = webcrypto;
 
 import { parseIdentityRequest, resolveIdentity, resolveConfigKey, normalizeConfigType, identityCapabilities } from './identity.js';
-const PLAYBACK_SYNC_PATHS = new Set(['/api/playback/sync', '/playback/sync', '/']);
+const PLAYBACK_SYNC_PATHS = new Set(['/api/playback/sync', '/playback/sync']);
 const IDENTITY_RESOLVE_PATHS = new Set(['/api/playback/identity/resolve', '/playback/identity/resolve']);
 const PLAYBACK_SCHEMA = 'webhtv.playback.v1';
 const TOMBSTONE_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;

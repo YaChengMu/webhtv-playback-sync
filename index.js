@@ -92,7 +92,7 @@ async function start() {
   await store.ready();
   server.listen(PORT, () => {
     console.log(`WebHTV Playback Sync (libsql port) listening on http://localhost:${PORT}`);
-    console.log('  sync endpoints: GET/POST / , /api/playback/sync , /playback/sync');
+    console.log('  sync endpoints: GET/POST /api/playback/sync , /playback/sync');
     console.log('  status:        GET /api/playback/sync/status , /playback/sync/status');
     console.log('  identity:      POST /api/playback/identity/resolve , /playback/identity/resolve');
     console.log('  reset:         DELETE /reset-db');
